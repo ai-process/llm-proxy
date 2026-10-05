@@ -1,0 +1,196 @@
+package registry
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+
+	"github.com/ai-process/llm-proxy/internal/llm"
+	"github.com/ai-process/llm-proxy/internal/proxydb"
+)
+
+// Snapshot is one immutable view of the routing config: enabled models and
+// rules plus decrypted vendor keys. Replaced wholesale on config change;
+// decrypted keys live only here, in process memory.
+type Snapshot struct {
+	Version int64
+	Models  map[string]*proxydb.Model // enabled only
+	Rules   []*proxydb.Rule           // enabled only, sorted by priority desc
+	// vendorKeys[apiKeyID][vendor] = decrypted credential.
+	vendorKeys map[string]map[string]string
+	// adapters caches built vendor adapters per (apiKeyID, modelID) for this
+	// snapshot's lifetime; dropped wholesale on config change.
+	adapters sync.Map
+	tracker  llm.UsageTracker
+}
+
+// VendorKey returns the calling client's decrypted credential for a vendor.
+func (s *Snapshot) VendorKey(apiKeyID, vendor string) (string, bool) {
+	key, ok := s.vendorKeys[apiKeyID][vendor]
+	return key, ok
+}
+
+// ClientModels lists enabled models the client holds a vendor key for,
+// sorted by id for stable ListModels output.
+func (s *Snapshot) ClientModels(apiKeyID string) []*proxydb.Model {
+	var out []*proxydb.Model
+	for _, m := range s.Models {
+		if _, ok := s.vendorKeys[apiKeyID][m.Vendor]; ok {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Configured reports whether any routing config exists at all.
+func (s *Snapshot) Configured() bool {
+	return len(s.Models) > 0 && len(s.Rules) > 0
+}
+
+// ValidateModel checks a single spec before it reaches the database.
+func ValidateModel(m *proxydb.Model) error {
+	if m.ID == "" {
+		return fmt.Errorf("model id is required")
+	}
+	if !ValidVendor(m.Vendor) {
+		return fmt.Errorf("model %s: unknown vendor %q", m.ID, m.Vendor)
+	}
+	if len(m.Efforts) == 0 {
+		return fmt.Errorf("model %s: at least one effort is required", m.ID)
+	}
+	for _, e := range m.Efforts {
+		if !ValidEffort(e) {
+			return fmt.Errorf("model %s: unknown effort %q", m.ID, e)
+		}
+	}
+	if m.RPM < 0 || m.PriceInPerMtok < 0 || m.PriceOutPerMtok < 0 ||
+		m.PriceInPeakPerMtok < 0 || m.PriceOutPeakPerMtok < 0 ||
+		m.DailyTokensPerKey < 0 || m.DailyTokensPerUser < 0 {
+		return fmt.Errorf("model %s: negative limits or prices", m.ID)
+	}
+	return nil
+}
+
+// Validate checks the full config as it would take effect: enabled rules with
+// chains filtered to enabled models. Runs inside every admin mutation
+// transaction and on load, so an invalid state can never become active.
+func Validate(models []*proxydb.Model, rules []*proxydb.Rule) error {
+	byID := map[string]*proxydb.Model{}
+	for _, m := range models {
+		if err := ValidateModel(m); err != nil {
+			return err
+		}
+		if _, dup := byID[m.ID]; dup {
+			return fmt.Errorf("duplicate model id %s", m.ID)
+		}
+		byID[m.ID] = m
+	}
+
+	names := map[string]bool{}
+	priorities := map[int32]bool{}
+	// catchAll[effort] flips when an enabled attribute-free rule serves it.
+	catchAll := map[string]bool{}
+
+	for _, r := range rules {
+		if r.Name == "" {
+			return fmt.Errorf("rule name is required")
+		}
+		if names[r.Name] {
+			return fmt.Errorf("duplicate rule name %s", r.Name)
+		}
+		names[r.Name] = true
+		if priorities[r.Priority] {
+			return fmt.Errorf("rule %s: duplicate priority %d", r.Name, r.Priority)
+		}
+		priorities[r.Priority] = true
+		if r.Effort != "" && !ValidEffort(r.Effort) {
+			return fmt.Errorf("rule %s: unknown effort %q", r.Name, r.Effort)
+		}
+		if len(r.Use) == 0 {
+			return fmt.Errorf("rule %s: empty model chain", r.Name)
+		}
+
+		seen := map[string]bool{}
+		var enabledChain []*proxydb.Model
+		for _, id := range r.Use {
+			m, ok := byID[id]
+			if !ok {
+				return fmt.Errorf("rule %s: unknown model %s", r.Name, id)
+			}
+			if seen[id] {
+				return fmt.Errorf("rule %s: duplicate model %s in chain", r.Name, id)
+			}
+			seen[id] = true
+			if m.Enabled {
+				enabledChain = append(enabledChain, m)
+			}
+		}
+		if !r.Enabled {
+			continue
+		}
+		if len(enabledChain) == 0 {
+			return fmt.Errorf("rule %s: every model in the chain is disabled", r.Name)
+		}
+		// Every effort the rule can match needs at least one serving model,
+		// or a matching request would find an empty chain at runtime.
+		for _, e := range matchableEfforts(r) {
+			if !anyServes(enabledChain, e) {
+				return fmt.Errorf("rule %s: no enabled model in the chain serves effort %s", r.Name, e)
+			}
+			if len(r.Attributes) == 0 {
+				catchAll[e] = true
+			}
+		}
+	}
+
+	// No rules at all is the models-first bootstrap state: GenerateText fails
+	// with not_configured until rules arrive. Once any rule exists, every
+	// effort must have a catch-all.
+	if len(rules) > 0 {
+		for _, e := range []string{EffortLow, EffortMedium, EffortHigh} {
+			if !catchAll[e] {
+				return fmt.Errorf("no catch-all rule (empty attributes) covers effort %s", e)
+			}
+		}
+	}
+	return nil
+}
+
+func matchableEfforts(r *proxydb.Rule) []string {
+	if r.Effort == "" {
+		return []string{EffortLow, EffortMedium, EffortHigh}
+	}
+	return []string{r.Effort}
+}
+
+func anyServes(models []*proxydb.Model, effort string) bool {
+	for _, m := range models {
+		for _, e := range m.Efforts {
+			if e == effort {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Serves reports whether a model lists the effort.
+func Serves(m *proxydb.Model, effort string) bool {
+	for _, e := range m.Efforts {
+		if e == effort {
+			return true
+		}
+	}
+	return false
+}
+
+// HasCapability reports whether a model lists the capability.
+func HasCapability(m *proxydb.Model, capability string) bool {
+	for _, c := range m.Capabilities {
+		if c == capability {
+			return true
+		}
+	}
+	return false
+}
