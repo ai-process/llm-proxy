@@ -26,8 +26,10 @@ type SnapshotProvider interface {
 // ProxyServer implements the data-plane LLMProxyService.
 type ProxyServer struct {
 	pb.UnimplementedLLMProxyServiceServer
-	snapshots SnapshotProvider
-	throttle  router.Throttle
+	snapshots     SnapshotProvider
+	throttle      router.Throttle
+	batchStore    BatchStore
+	batchMaxItems int
 }
 
 // Reserved attribute names. Callers may set usage_project when one api key
@@ -210,12 +212,14 @@ func (s *ProxyServer) ListModels(ctx context.Context, _ *pb.ListModelsRequest) (
 
 func modelInfo(m *proxydb.Model) *pb.ModelInfo {
 	return &pb.ModelInfo{
-		Id:              m.ID,
-		Vendor:          m.Vendor,
-		Efforts:         effortsToProto(m.Efforts),
-		Capabilities:    m.Capabilities,
-		Rpm:             m.RPM,
-		PriceInPerMtok:  m.PriceInPerMtok,
-		PriceOutPerMtok: m.PriceOutPerMtok,
+		Id:                   m.ID,
+		Vendor:               m.Vendor,
+		Efforts:              effortsToProto(m.Efforts),
+		Capabilities:         m.Capabilities,
+		Rpm:                  m.RPM,
+		PriceInPerMtok:       m.PriceInPerMtok,
+		PriceOutPerMtok:      m.PriceOutPerMtok,
+		PriceInBatchPerMtok:  m.BatchPriceInPerMtok(),
+		PriceOutBatchPerMtok: m.BatchPriceOutPerMtok(),
 	}
 }

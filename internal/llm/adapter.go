@@ -1,5 +1,10 @@
 package llm
 
+import (
+	"context"
+	"time"
+)
+
 type Response struct {
 	Choices []*Message
 	Usage   TokensUsage
@@ -34,4 +39,42 @@ type ClientAdapter interface {
 // assertion so the ClientAdapter contract stays untouched.
 type SpeechSynthesizer interface {
 	SynthesizeSpeech(text, language, userID string, meta map[string]string) (*SpeechResult, error)
+}
+
+// BatchSubmitItem is one request in a batch submission.
+type BatchSubmitItem struct {
+	CustomID string
+	Chat     *ChatContext
+}
+
+// BatchJobStatus is the vendor status for a batch job.
+type BatchJobStatus struct {
+	State       string // PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED, EXPIRED
+	TotalCount  int32
+	DoneCount   int32
+	FailedCount int32
+	CompletedAt *time.Time
+	Error       string
+}
+
+// BatchItemError represents an error for one item in a batch.
+type BatchItemError struct {
+	Code    int32
+	Reason  string
+	Message string
+}
+
+// BatchItemResult is the outcome of one item in a completed batch.
+type BatchItemResult struct {
+	CustomID string
+	Response *Response
+	Error    *BatchItemError
+}
+
+// BatchAdapter is the generic interface for batch generation vendors.
+type BatchAdapter interface {
+	SubmitBatch(ctx context.Context, batchID string, items []*BatchSubmitItem) (vendorJobID string, err error)
+	GetBatch(ctx context.Context, vendorJobID string) (*BatchJobStatus, error)
+	CancelBatch(ctx context.Context, vendorJobID string) error
+	FetchBatchResults(ctx context.Context, vendorJobID string, items []*BatchSubmitItem) ([]*BatchItemResult, error)
 }
