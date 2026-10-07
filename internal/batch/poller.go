@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/ai-process/llm-proxy/gen/llmproxy/v1"
@@ -93,8 +94,7 @@ func (p *Poller) Start(ctx context.Context) {
 		cleanupTicker := time.NewTicker(1 * time.Hour)
 		defer cleanupTicker.Stop()
 
-		// Run immediately once on start
-		p.PollOnce(ctx)
+		p.PollOnce(ctx) // Pick up unleased batches immediately after deploy without waiting for ticker
 
 		for {
 			select {
@@ -163,9 +163,9 @@ func (p *Poller) processBatch(ctx context.Context, b *proxydb.Batch) error {
 		return fmt.Errorf("model %q not found in routing snapshot", b.Model)
 	}
 
-	adapter, err := snap.Adapter(b.KeyName, m)
+	adapter, err := snap.Adapter(b.APIKeyID, m)
 	if err != nil {
-		return fmt.Errorf("resolve adapter for key %q model %q: %w", b.KeyName, m.ID, err)
+		return fmt.Errorf("resolve adapter for key ID %q model %q: %w", b.APIKeyID, m.ID, err)
 	}
 
 	batchAdapter, ok := adapter.(llm.BatchAdapter)
@@ -236,6 +236,15 @@ func (p *Poller) completeBatch(
 	var totalTokens int64
 	itemsToUpdate := make([]*proxydb.BatchItem, len(results))
 
+	type pendingUsage struct {
+		customID  string
+		inTokens  int
+		outTokens int
+		status    usagev1.Status
+		errReason string
+	}
+	var usageQueue []pendingUsage
+
 	for i, res := range results {
 		itemUpdate := &proxydb.BatchItem{
 			BatchID:  b.ID,
@@ -245,15 +254,12 @@ func (p *Poller) completeBatch(
 		if res.Error != nil {
 			failedCount++
 			itemUpdate.Status = "FAILED"
-			errMap := map[string]any{
-				"code":    res.Error.Code,
-				"reason":  res.Error.Reason,
-				"message": res.Error.Message,
-			}
-			errBytes, _ := json.Marshal(errMap)
-			itemUpdate.Error = errBytes
-
-			p.emitUsage(b, m, res.CustomID, 0, 0, usagev1.Status_STATUS_ERROR, res.Error.Reason)
+			itemUpdate.Error = res.Error.JSON()
+			usageQueue = append(usageQueue, pendingUsage{
+				customID:  res.CustomID,
+				status:    usagev1.Status_STATUS_ERROR,
+				errReason: res.Error.Reason,
+			})
 		} else if res.Response != nil {
 			doneCount++
 			itemUpdate.Status = "SUCCEEDED"
@@ -279,32 +285,25 @@ func (p *Poller) completeBatch(
 
 			itemTokens := int64(res.Response.Usage.Input + res.Response.Usage.Output)
 			totalTokens += itemTokens
-
-			p.emitUsage(b, m, res.CustomID, res.Response.Usage.Input, res.Response.Usage.Output, usagev1.Status_STATUS_SUCCESS, "")
+			usageQueue = append(usageQueue, pendingUsage{
+				customID:  res.CustomID,
+				inTokens:  res.Response.Usage.Input,
+				outTokens: res.Response.Usage.Output,
+				status:    usagev1.Status_STATUS_SUCCESS,
+			})
 		} else {
-			// Item had no response and no error
 			failedCount++
 			itemUpdate.Status = "FAILED"
-			errMap := map[string]any{
-				"code":    13, // Internal
-				"reason":  "vendor_error",
-				"message": "no response received from vendor",
-			}
-			errBytes, _ := json.Marshal(errMap)
-			itemUpdate.Error = errBytes
-			p.emitUsage(b, m, res.CustomID, 0, 0, usagev1.Status_STATUS_ERROR, "vendor_error")
+			itemErr := llm.NewBatchItemError(codes.Internal, "vendor_error", "no response received from vendor")
+			itemUpdate.Error = itemErr.JSON()
+			usageQueue = append(usageQueue, pendingUsage{
+				customID:  res.CustomID,
+				status:    usagev1.Status_STATUS_ERROR,
+				errReason: itemErr.Reason,
+			})
 		}
 
 		itemsToUpdate[i] = itemUpdate
-	}
-
-	// Charge total tokens to daily budgets
-	if p.throttle != nil && totalTokens > 0 {
-		userID := b.Attributes["user_id"]
-		if userID == "" {
-			userID = "svc:" + b.KeyName
-		}
-		p.throttle.ChargeDailyBudget(ctx, m, b.KeyName, userID, totalTokens)
 	}
 
 	finalState := "SUCCEEDED"
@@ -316,7 +315,21 @@ func (p *Poller) completeBatch(
 		completedAt = *status.CompletedAt
 	}
 
-	return p.db.CompleteBatch(ctx, b.ID, finalState, doneCount, failedCount, completedAt, itemsToUpdate)
+	// Commit DB state before external effects so failures don't record usage twice
+	if err := p.db.CompleteBatch(ctx, b.ID, finalState, doneCount, failedCount, completedAt, itemsToUpdate); err != nil {
+		return err
+	}
+
+	for _, u := range usageQueue {
+		p.emitUsage(b, m, u.customID, u.inTokens, u.outTokens, u.status, u.errReason)
+	}
+
+	if p.throttle != nil && totalTokens > 0 {
+		userID := router.UserID(b.Attributes, b.KeyName)
+		p.throttle.ChargeDailyBudget(ctx, m, b.KeyName, userID, totalTokens)
+	}
+
+	return nil
 }
 
 func (p *Poller) emitUsage(
@@ -351,10 +364,7 @@ func (p *Poller) emitUsage(
 		meta["cost_usd"] = strconv.FormatFloat(cost, 'f', -1, 64)
 	}
 
-	userID := b.Attributes["user_id"]
-	if userID == "" {
-		userID = "svc:" + b.KeyName
-	}
+	userID := router.UserID(b.Attributes, b.KeyName)
 	actionID := b.ActionID
 	if actionID == "" {
 		actionID = "llmproxy.generate_text"

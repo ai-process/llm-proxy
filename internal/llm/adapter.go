@@ -2,7 +2,10 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"time"
+
+	"google.golang.org/grpc/codes"
 )
 
 type Response struct {
@@ -59,9 +62,24 @@ type BatchJobStatus struct {
 
 // BatchItemError represents an error for one item in a batch.
 type BatchItemError struct {
-	Code    int32
-	Reason  string
-	Message string
+	Code    int32  `json:"code"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// NewBatchItemError builds a BatchItemError from a standard gRPC status code.
+func NewBatchItemError(code codes.Code, reason, message string) *BatchItemError {
+	return &BatchItemError{
+		Code:    int32(code),
+		Reason:  reason,
+		Message: message,
+	}
+}
+
+// JSON serializes the error for storage.
+func (e *BatchItemError) JSON() []byte {
+	b, _ := json.Marshal(e)
+	return b
 }
 
 // BatchItemResult is the outcome of one item in a completed batch.

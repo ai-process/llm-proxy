@@ -74,7 +74,7 @@ func Load() *Config {
 		UsageProjectID:     getEnv("USAGE_PROJECT_ID", "llm-proxy"),
 		BatchMaxItems:      getIntEnv("BATCH_MAX_ITEMS", 10000),
 		BatchPollInterval:  time.Duration(getIntEnv("BATCH_POLL_SECONDS", 60)) * time.Second,
-		ResultsRetention:   getRetentionEnv("RESULTS_RETENTION", 7*24*time.Hour),
+		ResultsRetention:   getRetentionEnv("RESULTS_RETENTION_DAYS", 7*24*time.Hour),
 		SentryDSN:          getEnv("SENTRY_DSN", ""),
 		SentryEnvironment:  getEnv("SENTRY_ENVIRONMENT", "development"),
 		SentryRelease:      getEnv("SENTRY_RELEASE", ""),

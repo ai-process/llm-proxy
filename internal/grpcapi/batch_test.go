@@ -16,12 +16,14 @@ import (
 	"github.com/ai-process/llm-proxy/internal/llm"
 	"github.com/ai-process/llm-proxy/internal/proxydb"
 	"github.com/ai-process/llm-proxy/internal/registry"
+	"github.com/ai-process/llm-proxy/internal/router"
 )
 
 type fakeBatchStore struct {
-	batches  map[string]*proxydb.Batch
-	byClient map[string]*proxydb.Batch
-	items    map[string][]*proxydb.BatchItem
+	batches        map[string]*proxydb.Batch
+	byClient       map[string]*proxydb.Batch
+	items          map[string][]*proxydb.BatchItem
+	createBatchErr error
 }
 
 func newFakeBatchStore() *fakeBatchStore {
@@ -33,6 +35,9 @@ func newFakeBatchStore() *fakeBatchStore {
 }
 
 func (s *fakeBatchStore) CreateBatch(ctx context.Context, b *proxydb.Batch, items []*proxydb.BatchItem) (*proxydb.Batch, error) {
+	if s.createBatchErr != nil {
+		return nil, s.createBatchErr
+	}
 	if b.ClientBatchID != "" {
 		k := b.APIKeyID + ":" + b.ClientBatchID
 		if existing, ok := s.byClient[k]; ok {
@@ -89,8 +94,10 @@ func (s *fakeBatchStore) CancelBatch(ctx context.Context, id, apiKeyID string) (
 }
 
 type fakeBatchAdapter struct {
-	submittedID string
-	submitted   []*llm.BatchSubmitItem
+	submittedID    string
+	submitted      []*llm.BatchSubmitItem
+	cancelledJobID string
+	cancelErr      error
 }
 
 func (f *fakeBatchAdapter) GenerateText(chat *llm.ChatContext) (*llm.Response, error) {
@@ -108,7 +115,8 @@ func (f *fakeBatchAdapter) GetBatch(ctx context.Context, vendorJobID string) (*l
 }
 
 func (f *fakeBatchAdapter) CancelBatch(ctx context.Context, vendorJobID string) error {
-	return nil
+	f.cancelledJobID = vendorJobID
+	return f.cancelErr
 }
 
 func (f *fakeBatchAdapter) FetchBatchResults(ctx context.Context, vendorJobID string, items []*llm.BatchSubmitItem) ([]*llm.BatchItemResult, error) {
@@ -226,9 +234,14 @@ func TestSubmitBatch_SuccessAndIdempotency(t *testing.T) {
 	if res1.GetBatch().GetState() != pb.BatchState_BATCH_STATE_PENDING {
 		t.Fatalf("expected PENDING state, got %v", res1.GetBatch().GetState())
 	}
+	// Verify ClientBatchId and counts are preserved
+	if res1.GetBatch().GetClientBatchId() != "client-batch-abc" {
+		t.Fatalf("expected client_batch_id 'client-batch-abc', got %q", res1.GetBatch().GetClientBatchId())
+	}
 	if res1.GetBatch().GetCounts().GetTotal() != 2 {
 		t.Fatalf("expected total 2, got %d", res1.GetBatch().GetCounts().GetTotal())
 	}
+
 	batchID := res1.GetBatch().GetId()
 
 	// Verify adapter received submission
@@ -383,15 +396,17 @@ func TestListBatchResults_PaginationAndOutcomes(t *testing.T) {
 }
 
 func TestCancelBatch(t *testing.T) {
-	server, store, _ := batchServerFixture()
+	server, store, adapter := batchServerFixture()
 	ctx := authCtx("key-1", "test-client")
 
 	store.batches["b-cancel"] = &proxydb.Batch{
-		ID:        "b-cancel",
-		APIKeyID:  "key-1",
-		Model:     "gemini-flash",
-		State:     "RUNNING",
-		CreatedAt: time.Now().UTC(),
+		ID:            "b-cancel",
+		APIKeyID:      "key-1",
+		KeyName:       "test-client",
+		Model:         "gemini-flash",
+		VendorJobName: "vendor-job-cancel-123",
+		State:         "RUNNING",
+		CreatedAt:     time.Now().UTC(),
 	}
 
 	_, err := server.CancelBatch(ctx, &pb.CancelBatchRequest{BatchId: "b-cancel"})
@@ -399,8 +414,123 @@ func TestCancelBatch(t *testing.T) {
 		t.Fatalf("CancelBatch failed: %v", err)
 	}
 
+	if adapter.cancelledJobID != "vendor-job-cancel-123" {
+		t.Fatalf("expected vendor cancel for vendor-job-cancel-123, got %q", adapter.cancelledJobID)
+	}
+
 	b := store.batches["b-cancel"]
 	if b.State != "CANCELLED" {
 		t.Fatalf("expected state CANCELLED, got %s", b.State)
+	}
+
+	// Vendor cancel error must propagate and not mark batch cancelled
+	store.batches["b-cancel-fail"] = &proxydb.Batch{
+		ID:            "b-cancel-fail",
+		APIKeyID:      "key-1",
+		KeyName:       "test-client",
+		Model:         "gemini-flash",
+		VendorJobName: "vendor-job-fail",
+		State:         "RUNNING",
+		CreatedAt:     time.Now().UTC(),
+	}
+	adapter.cancelErr = errors.New("vendor unavailable")
+	_, err = server.CancelBatch(ctx, &pb.CancelBatchRequest{BatchId: "b-cancel-fail"})
+	if err == nil {
+		t.Fatal("expected error on vendor cancel failure, got nil")
+	}
+	if store.batches["b-cancel-fail"].State != "RUNNING" {
+		t.Fatalf("expected batch state to remain RUNNING on vendor cancel error, got %s", store.batches["b-cancel-fail"].State)
+	}
+}
+
+func TestSubmitBatch_CancelVendorOnDBFailure(t *testing.T) {
+	server, store, adapter := batchServerFixture()
+	ctx := authCtx("key-1", "test-client")
+
+	store.createBatchErr = errors.New("database connection refused")
+
+	req := &pb.SubmitBatchRequest{
+		Effort: pb.Effort_EFFORT_MEDIUM,
+		Items: []*pb.BatchItemRequest{
+			{CustomId: "c1", Request: &pb.GenerateTextRequest{Messages: []*pb.ChatMessage{{Text: "hi"}}}},
+		},
+	}
+
+	_, err := server.SubmitBatch(ctx, req)
+	if err == nil {
+		t.Fatal("expected error when DB write fails, got nil")
+	}
+
+	if adapter.cancelledJobID == "" {
+		t.Fatal("expected vendor batch to be cancelled when DB write failed")
+	}
+}
+
+type fakeBatchThrottle struct {
+	router.NoopThrottle
+	checkedKeyName string
+	checkedUserID  string
+	trippedReason  string
+}
+
+func (f *fakeBatchThrottle) CheckDailyBudget(ctx context.Context, m *proxydb.Model, keyName, userID string) string {
+	f.checkedKeyName = keyName
+	f.checkedUserID = userID
+	return f.trippedReason
+}
+
+func TestSubmitBatch_ServiceCallerBudgetCheck(t *testing.T) {
+	adapter := &fakeBatchAdapter{}
+	models := []*proxydb.Model{
+		{
+			ID:                 "gemini-flash",
+			Vendor:             registry.VendorGoogle,
+			Capabilities:       []string{registry.CapabilityBatch},
+			Efforts:            []string{registry.EffortLow, registry.EffortMedium, registry.EffortHigh},
+			DailyTokensPerUser: 1000,
+			Enabled:            true,
+		},
+	}
+	rules := []*proxydb.Rule{
+		{
+			Name:     "default-batch",
+			Priority: 1,
+			Effort:   registry.EffortMedium,
+			Use:      []string{"gemini-flash"},
+			Enabled:  true,
+		},
+	}
+	keys := map[string]map[string]string{
+		"key-1": {registry.VendorGoogle: "g-secret"},
+	}
+
+	snap := registry.NewSnapshotForTest(models, rules, keys, nil)
+	snap.SetAdapter("key-1", "gemini-flash", adapter)
+
+	store := newFakeBatchStore()
+	th := &fakeBatchThrottle{}
+	server := NewProxyServer(fixedSnapshot{snap}, th).WithBatch(store, 100)
+	ctx := authCtx("key-1", "service-client")
+
+	// 1. Submit with no user_id attribute -> must check budget with svc:service-client
+	req := &pb.SubmitBatchRequest{
+		Effort: pb.Effort_EFFORT_MEDIUM,
+		Items: []*pb.BatchItemRequest{
+			{CustomId: "c1", Request: &pb.GenerateTextRequest{Messages: []*pb.ChatMessage{{Text: "hi"}}}},
+		},
+	}
+	_, err := server.SubmitBatch(ctx, req)
+	if err != nil {
+		t.Fatalf("SubmitBatch failed: %v", err)
+	}
+	if th.checkedUserID != "svc:service-client" {
+		t.Fatalf("expected checked user ID 'svc:service-client', got %q", th.checkedUserID)
+	}
+
+	// 2. When budget is exhausted -> must return ResourceExhausted
+	th.trippedReason = "budget_user"
+	_, err = server.SubmitBatch(ctx, req)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted when budget tripped, got %v", err)
 	}
 }

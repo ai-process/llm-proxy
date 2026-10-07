@@ -54,6 +54,14 @@ func (NoopThrottle) Settle(*Reservation, llm.TokensUsage) {}
 func (NoopThrottle) CheckDailyBudget(context.Context, *proxydb.Model, string, string) string { return "" }
 func (NoopThrottle) ChargeDailyBudget(context.Context, *proxydb.Model, string, string, int64) {}
 
+// UserID resolves user identity from attributes with an svc:<keyName> fallback.
+func UserID(attributes map[string]string, keyName string) string {
+	if u := attributes["user_id"]; u != "" {
+		return u
+	}
+	return "svc:" + keyName
+}
+
 // SchemaFailure reports a model that answered but could not produce the
 // requested shape, even given a second try. It advances the chain rather than
 // ending it: another model may well comply.

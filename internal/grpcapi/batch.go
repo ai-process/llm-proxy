@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -99,7 +100,7 @@ func (s *ProxyServer) SubmitBatch(ctx context.Context, req *pb.SubmitBatchReques
 		return nil, router.ToStatus(router.ErrNotConfigured)
 	}
 
-	userID := req.GetAttributes()["user_id"]
+	userID := router.UserID(req.GetAttributes(), id.Name)
 	model, err := router.ResolveBatchModel(ctx, snap, s.throttle, rule.Use, id.KeyID, id.Name, userID)
 	if err != nil {
 		return nil, router.ToStatus(err)
@@ -113,6 +114,12 @@ func (s *ProxyServer) SubmitBatch(ctx context.Context, req *pb.SubmitBatchReques
 	batchAdapter, ok := adapter.(llm.BatchAdapter)
 	if !ok {
 		return nil, status.Error(codes.FailedPrecondition, "no_capable_model")
+	}
+
+	if req.GetClientBatchId() != "" {
+		if existing, err := s.batchStore.GetBatchByClientBatchID(ctx, id.KeyID, req.GetClientBatchId()); err == nil && existing != nil {
+			return &pb.SubmitBatchResponse{Batch: batchToProto(existing)}, nil
+		}
 	}
 
 	batchID := uuid.Must(uuid.NewV7()).String()
@@ -173,7 +180,15 @@ func (s *ProxyServer) SubmitBatch(ctx context.Context, req *pb.SubmitBatchReques
 
 	created, err := s.batchStore.CreateBatch(ctx, batchRecord, dbItems)
 	if err != nil {
+		if cancelErr := batchAdapter.CancelBatch(ctx, vendorJobID); cancelErr != nil {
+			log.Error().Err(cancelErr).Str("batch_id", batchID).Str("vendor_job", vendorJobID).Msg("failed to cancel vendor batch on db store failure")
+		}
 		return nil, status.Errorf(codes.Internal, "failed to store batch: %v", err)
+	}
+	if created.ID != batchID {
+		if cancelErr := batchAdapter.CancelBatch(ctx, vendorJobID); cancelErr != nil {
+			log.Error().Err(cancelErr).Str("batch_id", batchID).Str("vendor_job", vendorJobID).Msg("failed to cancel duplicate vendor batch on idempotency collision")
+		}
 	}
 
 	return &pb.SubmitBatchResponse{Batch: batchToProto(created)}, nil
@@ -317,19 +332,33 @@ func (s *ProxyServer) CancelBatch(ctx context.Context, req *pb.CancelBatchReques
 	}
 
 	snap := s.snapshots.Snapshot()
-	if snap != nil {
-		if m, ok := snap.Models[b.Model]; ok {
-			if adapter, err := snap.Adapter(b.KeyName, m); err == nil {
-				if ba, ok := adapter.(llm.BatchAdapter); ok {
-					_ = ba.CancelBatch(ctx, b.VendorJobName)
-				}
-			}
-		}
+	if snap == nil {
+		return nil, status.Error(codes.Unavailable, "proxy configuration not ready")
+	}
+	m, ok := snap.Models[b.Model]
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "batch model %q not found", b.Model)
+	}
+	adapter, err := snap.Adapter(id.KeyID, m)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "resolve adapter for key ID %q: %v", id.KeyID, err)
+	}
+	ba, ok := adapter.(llm.BatchAdapter)
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "model %q does not support batch", b.Model)
+	}
+	if err := ba.CancelBatch(ctx, b.VendorJobName); err != nil {
+		log.Error().Err(err).Str("batch_id", b.ID).Str("vendor_job", b.VendorJobName).Msg("vendor cancel batch failed")
+		return nil, status.Errorf(codes.Internal, "vendor cancel batch failed: %v", err)
 	}
 
 	_, err = s.batchStore.CancelBatch(ctx, b.ID, id.KeyID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "cancel batch: %v", err)
+		if errors.Is(err, proxydb.ErrNotFound) {
+			// Already moved to a terminal state
+			return &pb.CancelBatchResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "cancel batch in store: %v", err)
 	}
 
 	return &pb.CancelBatchResponse{}, nil
@@ -340,8 +369,9 @@ func batchToProto(b *proxydb.Batch) *pb.Batch {
 		return nil
 	}
 	out := &pb.Batch{
-		Id:    b.ID,
-		State: mapBatchStateToProto(b.State),
+		Id:            b.ID,
+		ClientBatchId: b.ClientBatchID,
+		State:         mapBatchStateToProto(b.State),
 		Counts: &pb.BatchCounts{
 			Total:  b.TotalCount,
 			Done:   b.DoneCount,

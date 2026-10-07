@@ -148,6 +148,15 @@ func TestBatchStorageAndIdempotency(t *testing.T) {
 		t.Fatalf("unexpected running state: %+v", runningBatch)
 	}
 
+	// Calling UpdateBatchRunning again on RUNNING batch should also succeed and update counts
+	if err := db.UpdateBatchRunning(ctx, batchID, 2, 2, 0); err != nil {
+		t.Fatalf("second UpdateBatchRunning on RUNNING batch failed: %v", err)
+	}
+	runningBatch2, err := db.GetBatchByID(ctx, batchID)
+	if err != nil || runningBatch2.DoneCount != 2 {
+		t.Fatalf("expected done count 2 after second UpdateBatchRunning, got %+v", runningBatch2)
+	}
+
 	// 5. Complete batch
 	resultBytes := []byte(`{"choices":["output text"]}`)
 	errBytes, _ := json.Marshal(map[string]any{"code": 9, "reason": "output_truncated"})
@@ -199,6 +208,21 @@ func TestBatchStorageAndIdempotency(t *testing.T) {
 	}
 	if err := json.Unmarshal(storedItems[1].Error, &errObj); err != nil || errObj.Reason != "output_truncated" {
 		t.Fatalf("unexpected item 1 error: %s", string(storedItems[1].Error))
+	}
+
+	// 7. Verify terminal state guards: CompleteBatch, ExpireBatch, CancelBatch cannot mutate SUCCEEDED batch
+	if err := db.CompleteBatch(ctx, batchID, "FAILED", 0, 2, now, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when trying to complete already SUCCEEDED batch, got %v", err)
+	}
+	if err := db.ExpireBatch(ctx, batchID, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when trying to expire already SUCCEEDED batch, got %v", err)
+	}
+	if _, err := db.CancelBatch(ctx, batchID, testAPIKeyID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when trying to cancel already SUCCEEDED batch, got %v", err)
+	}
+	finalBatch, _ := db.GetBatchByID(ctx, batchID)
+	if finalBatch.State != "SUCCEEDED" {
+		t.Fatalf("batch state should have remained SUCCEEDED, got %s", finalBatch.State)
 	}
 }
 
@@ -309,6 +333,14 @@ func TestBatchCancelAndExpire(t *testing.T) {
 	if items[0].Status != "FAILED" {
 		t.Fatalf("expected pending item to be marked FAILED on cancel, got %s", items[0].Status)
 	}
+	var cancelErrObj struct {
+		Code    int    `json:"code"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(items[0].Error, &cancelErrObj); err != nil || cancelErrObj.Code != 1 || cancelErrObj.Reason != "batch_cancelled" {
+		t.Fatalf("unexpected cancel error payload: %s", string(items[0].Error))
+	}
 
 	// 2. Expire
 	expireID := uuid.NewString()
@@ -336,6 +368,14 @@ func TestBatchCancelAndExpire(t *testing.T) {
 	expItems, _ := db.ListBatchItems(ctx, expireID, 10, 0)
 	if expItems[0].Status != "FAILED" {
 		t.Fatalf("expected pending item to be marked FAILED on expire, got %s", expItems[0].Status)
+	}
+	var expErrObj struct {
+		Code    int    `json:"code"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(expItems[0].Error, &expErrObj); err != nil || expErrObj.Code != 4 || expErrObj.Reason != "batch_expired" {
+		t.Fatalf("unexpected expire error payload: %s", string(expItems[0].Error))
 	}
 }
 

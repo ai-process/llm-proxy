@@ -573,13 +573,13 @@ func mapJobState(state genai.JobState) string {
 	switch state {
 	case genai.JobStatePending, genai.JobStateQueued:
 		return "PENDING"
-	case genai.JobStateRunning, genai.JobStateUpdating:
+	case genai.JobStateRunning, genai.JobStateUpdating, genai.JobStateCancelling:
 		return "RUNNING"
 	case genai.JobStateSucceeded:
 		return "SUCCEEDED"
 	case genai.JobStateFailed:
 		return "FAILED"
-	case genai.JobStateCancelled, genai.JobStateCancelling:
+	case genai.JobStateCancelled:
 		return "CANCELLED"
 	case genai.JobStateExpired:
 		return "EXPIRED"

@@ -9,6 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"google.golang.org/grpc/codes"
+
+	"github.com/ai-process/llm-proxy/internal/llm"
 )
 
 // ErrBatchAlreadyExists is returned on idempotency conflict if client resubmitted.
@@ -62,7 +65,6 @@ func (d *DB) CreateBatch(ctx context.Context, b *Batch, items []*BatchItem) (*Ba
 		return nil, fmt.Errorf("insert batch: %w", err)
 	}
 
-	// Insert items
 	if len(items) > 0 {
 		batch := &pgx.Batch{}
 		for _, item := range items {
@@ -208,7 +210,7 @@ func (d *DB) CancelBatch(ctx context.Context, id, apiKeyID string) (*Batch, erro
 	err = tx.QueryRow(ctx,
 		`UPDATE batch
 		 SET state = 'CANCELLED', completed_at = $1, leased_until = NULL
-		 WHERE id = $2 AND api_key_id = $3
+		 WHERE id = $2 AND api_key_id = $3 AND state IN ('PENDING', 'RUNNING')
 		 RETURNING id, client_batch_id, api_key_id, key_name, model, vendor_job_name, state,
 		           total_count, done_count, failed_count, attributes, action_id,
 		           created_at, completed_at, leased_until`,
@@ -229,16 +231,14 @@ func (d *DB) CancelBatch(ctx context.Context, id, apiKeyID string) (*Batch, erro
 		_ = json.Unmarshal(attrsJSON, &b.Attributes)
 	}
 
-	// Fail all pending items
-	cancelErrBytes, _ := json.Marshal(map[string]any{
-		"code":    1, // Canceled
-		"message": "batch_cancelled",
-	})
-	_, _ = tx.Exec(ctx,
+	cancelErrBytes := llm.NewBatchItemError(codes.Canceled, "batch_cancelled", "batch was cancelled").JSON()
+	if _, err := tx.Exec(ctx,
 		`UPDATE batch_item
 		 SET status = 'FAILED', error = $1
 		 WHERE batch_id = $2 AND status = 'PENDING'`,
-		cancelErrBytes, id)
+		cancelErrBytes, id); err != nil {
+		return nil, fmt.Errorf("fail pending items on cancel: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -289,12 +289,18 @@ func (d *DB) LeaseUnfinishedBatches(ctx context.Context, leaseDuration time.Dura
 }
 
 func (d *DB) UpdateBatchRunning(ctx context.Context, id string, total, done, failed int32) error {
-	_, err := d.pool.Exec(ctx,
+	tag, err := d.pool.Exec(ctx,
 		`UPDATE batch
 		 SET state = 'RUNNING', total_count = $1, done_count = $2, failed_count = $3
-		 WHERE id = $4 AND state = 'PENDING'`,
+		 WHERE id = $4 AND state IN ('PENDING', 'RUNNING')`,
 		total, done, failed, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (d *DB) CompleteBatch(ctx context.Context, id string, finalState string, doneCount, failedCount int32, completedAt time.Time, items []*BatchItem) error {
@@ -304,13 +310,16 @@ func (d *DB) CompleteBatch(ctx context.Context, id string, finalState string, do
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`UPDATE batch
 		 SET state = $1, done_count = $2, failed_count = $3, completed_at = $4, leased_until = NULL
-		 WHERE id = $5`,
+		 WHERE id = $5 AND state IN ('PENDING', 'RUNNING')`,
 		finalState, doneCount, failedCount, completedAt, id)
 	if err != nil {
 		return fmt.Errorf("update batch final state: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 
 	if len(items) > 0 {
@@ -346,26 +355,25 @@ func (d *DB) ExpireBatch(ctx context.Context, id string, expiredAt time.Time) er
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`UPDATE batch
 		 SET state = 'EXPIRED', completed_at = $1, leased_until = NULL
-		 WHERE id = $2`,
+		 WHERE id = $2 AND state IN ('PENDING', 'RUNNING')`,
 		expiredAt, id)
 	if err != nil {
 		return err
 	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
 
-	expiredErrBytes, _ := json.Marshal(map[string]any{
-		"code":    9, // FailedPrecondition / DeadlineExceeded
-		"message": "batch_expired",
-	})
-	_, err = tx.Exec(ctx,
+	expiredErrBytes := llm.NewBatchItemError(codes.DeadlineExceeded, "batch_expired", "batch expired before item completed").JSON()
+	if _, err := tx.Exec(ctx,
 		`UPDATE batch_item
 		 SET status = 'FAILED', error = $1
 		 WHERE batch_id = $2 AND status = 'PENDING'`,
-		expiredErrBytes, id)
-	if err != nil {
-		return err
+		expiredErrBytes, id); err != nil {
+		return fmt.Errorf("fail pending items on expire: %w", err)
 	}
 
 	return tx.Commit(ctx)

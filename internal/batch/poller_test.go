@@ -2,6 +2,7 @@ package batch
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ type fakePollerDB struct {
 	completedFail map[string]int32
 	expired       map[string]bool
 	deletedOlder  time.Time
+	completeErr   error
 }
 
 func newFakePollerDB() *fakePollerDB {
@@ -49,6 +51,9 @@ func (f *fakePollerDB) UpdateBatchRunning(ctx context.Context, id string, total,
 }
 
 func (f *fakePollerDB) CompleteBatch(ctx context.Context, id string, finalState string, doneCount, failedCount int32, completedAt time.Time, items []*proxydb.BatchItem) error {
+	if f.completeErr != nil {
+		return f.completeErr
+	}
 	f.completed[id] = finalState
 	f.completedDone[id] = doneCount
 	f.completedFail[id] = failedCount
@@ -193,12 +198,12 @@ func TestPoller_ProcessSucceededBatch(t *testing.T) {
 	}
 
 	snap := registry.NewSnapshotForTest([]*proxydb.Model{model}, nil, nil, nil)
-	snap.SetAdapter("key-1", "gemini-flash", adapter)
+	snap.SetAdapter("key-id-1", "gemini-flash", adapter)
 
 	db := newFakePollerDB()
 	batchRecord := &proxydb.Batch{
 		ID:            "b-100",
-		KeyName:       "key-1",
+		KeyName:       "client-app-label",
 		APIKeyID:      "key-id-1",
 		Model:         "gemini-flash",
 		VendorJobName: "vendor-job-100",
@@ -248,7 +253,7 @@ func TestPoller_ProcessSucceededBatch(t *testing.T) {
 	}
 
 	// 3. Verify tokens charged to daily budget
-	charged := th.chargedTokens["gemini-flash:key-1:u-42"]
+	charged := th.chargedTokens["gemini-flash:client-app-label:u-42"]
 	if charged != 150 { // 100 in + 50 out
 		t.Fatalf("expected 150 tokens charged to daily budget, got %d", charged)
 	}
@@ -268,12 +273,13 @@ func TestPoller_ProcessExpiredBatch(t *testing.T) {
 	}
 
 	snap := registry.NewSnapshotForTest([]*proxydb.Model{model}, nil, nil, nil)
-	snap.SetAdapter("key-1", "gemini-flash", adapter)
+	snap.SetAdapter("key-id-2", "gemini-flash", adapter)
 
 	db := newFakePollerDB()
 	batchRecord := &proxydb.Batch{
 		ID:            "b-exp",
-		KeyName:       "key-1",
+		KeyName:       "client-app-label-2",
+		APIKeyID:      "key-id-2",
 		Model:         "gemini-flash",
 		VendorJobName: "vendor-job-exp",
 		State:         "RUNNING",
@@ -286,6 +292,60 @@ func TestPoller_ProcessExpiredBatch(t *testing.T) {
 
 	if !db.expired["b-exp"] {
 		t.Fatal("expected batch to be marked EXPIRED in DB")
+	}
+}
+
+func TestPoller_DBCommitFailureDoesNotEmitUsage(t *testing.T) {
+	adapter := &fakeBatchAdapter{
+		status: &llm.BatchJobStatus{
+			State:     "SUCCEEDED",
+			DoneCount: 1,
+		},
+		results: []*llm.BatchItemResult{
+			{
+				CustomID: "c1",
+				Response: &llm.Response{
+					Choices: []*llm.Message{{Text: "choice 1"}},
+					Usage:   llm.TokensUsage{Input: 100, Output: 50},
+				},
+			},
+		},
+	}
+	model := &proxydb.Model{
+		ID:           "gemini-flash",
+		Vendor:       registry.VendorGoogle,
+		Capabilities: []string{registry.CapabilityBatch},
+		Enabled:      true,
+	}
+	snap := registry.NewSnapshotForTest([]*proxydb.Model{model}, nil, nil, nil)
+	snap.SetAdapter("key-id-fail", "gemini-flash", adapter)
+
+	db := newFakePollerDB()
+	db.completeErr = errors.New("simulated db commit error")
+
+	batchRecord := &proxydb.Batch{
+		ID:            "b-fail",
+		KeyName:       "client-app",
+		APIKeyID:      "key-id-fail",
+		Model:         "gemini-flash",
+		VendorJobName: "vendor-job-fail",
+		State:         "RUNNING",
+	}
+	db.batches["b-fail"] = batchRecord
+	db.leased = []*proxydb.Batch{batchRecord}
+	db.items["b-fail"] = []*proxydb.BatchItem{{BatchID: "b-fail", CustomID: "c1"}}
+
+	tracker := &fakeUsageTracker{}
+	th := &fakeThrottle{}
+
+	poller := NewPoller(db, fixedSnapshot{snap}, th, tracker, 1*time.Second, 7*24*time.Hour)
+	poller.PollOnce(context.Background())
+
+	if len(tracker.recordedEvents) != 0 {
+		t.Fatalf("expected 0 usage events on db commit failure, got %d", len(tracker.recordedEvents))
+	}
+	if len(th.chargedTokens) != 0 {
+		t.Fatalf("expected 0 tokens charged on db commit failure, got %d", len(th.chargedTokens))
 	}
 }
 

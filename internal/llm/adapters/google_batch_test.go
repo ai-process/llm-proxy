@@ -44,6 +44,18 @@ func TestParseGenerateContentResponse_MaxTokensTruncation(t *testing.T) {
 	}
 }
 
+func TestMapJobState(t *testing.T) {
+	if s := mapJobState(genai.JobStateCancelling); s != "RUNNING" {
+		t.Fatalf("expected JobStateCancelling to map to RUNNING (unfinished), got %s", s)
+	}
+	if s := mapJobState(genai.JobStateCancelled); s != "CANCELLED" {
+		t.Fatalf("expected JobStateCancelled to map to CANCELLED, got %s", s)
+	}
+	if s := mapJobState(genai.JobStateRunning); s != "RUNNING" {
+		t.Fatalf("expected JobStateRunning to map to RUNNING, got %s", s)
+	}
+}
+
 func TestParseGenerateContentResponse_UsageAndContent(t *testing.T) {
 	adapter := &GoogleAdapter{}
 
