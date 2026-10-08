@@ -47,5 +47,16 @@ a usage sink.
 - Cancelling vendor jobs is a request, not a result: a local row moves to
   `CANCELLED` only after the vendor confirms it and its results have been
   fetched.
+- Prune dead code on interface or lifecycle changes. When changing architecture or
+  state transitions, remove unused methods from store implementations, worker
+  interfaces, RPC handler interfaces, test fakes, and tests.
+- Use structured vendor error types. Inspect SDK error types (e.g.
+  `errors.As(err, &genai.APIError{})` with status codes) for idempotency or terminal
+  checks instead of brittle string matching on error text.
+- Keep documentation in lockstep with behavioral changes. Any change in runtime
+  behavior (e.g. identity fallback affecting quotas) must update proto comments,
+  generated code, README tables, and PR descriptions.
+- Keep communication and comments concise (no walls of text). Never add
+  `Co-Authored-By` or AI attribution markers to commits or PRs.
 - `gen/` is committed; regenerate with `make proto` after editing `proto/`.
 - Run `go test ./... -race` before committing.
