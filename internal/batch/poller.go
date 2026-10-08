@@ -37,7 +37,6 @@ type PollerDB interface {
 	UpdateBatchRunning(ctx context.Context, id string, total, done, failed int32) error
 	CompleteBatch(ctx context.Context, id string, finalState string, doneCount, failedCount int32, completedAt time.Time, items []*proxydb.BatchItem) error
 	ExpireBatch(ctx context.Context, id string, expiredAt time.Time) error
-	CancelBatch(ctx context.Context, id, apiKeyID string) (*proxydb.Batch, error)
 	ListAllBatchItems(ctx context.Context, batchID string) ([]*proxydb.BatchItem, error)
 	DeleteBatchesOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
 }

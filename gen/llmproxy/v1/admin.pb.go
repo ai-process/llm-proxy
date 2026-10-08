@@ -41,7 +41,7 @@ type ModelSpec struct {
 	PriceInBatchPerMtok  float64 `protobuf:"fixed64,14,opt,name=price_in_batch_per_mtok,json=priceInBatchPerMtok,proto3" json:"price_in_batch_per_mtok,omitempty"`
 	PriceOutBatchPerMtok float64 `protobuf:"fixed64,15,opt,name=price_out_batch_per_mtok,json=priceOutBatchPerMtok,proto3" json:"price_out_batch_per_mtok,omitempty"`
 	DailyTokensPerKey    int64   `protobuf:"varint,9,opt,name=daily_tokens_per_key,json=dailyTokensPerKey,proto3" json:"daily_tokens_per_key,omitempty"`     // per api key per UTC day, 0 = unlimited
-	DailyTokensPerUser   int64   `protobuf:"varint,10,opt,name=daily_tokens_per_user,json=dailyTokensPerUser,proto3" json:"daily_tokens_per_user,omitempty"` // per attributes["user_id"] per UTC day
+	DailyTokensPerUser   int64   `protobuf:"varint,10,opt,name=daily_tokens_per_user,json=dailyTokensPerUser,proto3" json:"daily_tokens_per_user,omitempty"` // per attributes["user_id"] (or svc:<key_name> fallback) per UTC day
 	Enabled              bool    `protobuf:"varint,11,opt,name=enabled,proto3" json:"enabled,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache

@@ -212,56 +212,6 @@ func (d *DB) ListAllBatchItems(ctx context.Context, batchID string) ([]*BatchIte
 	return items, rows.Err()
 }
 
-func (d *DB) CancelBatch(ctx context.Context, id, apiKeyID string) (*Batch, error) {
-	tx, err := d.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	var b Batch
-	var attrsJSON []byte
-	var clientBatchID *string
-	now := time.Now()
-	err = tx.QueryRow(ctx,
-		`UPDATE batch
-		 SET state = 'CANCELLED', completed_at = $1, leased_until = NULL
-		 WHERE id = $2 AND api_key_id = $3 AND state IN ('PENDING', 'RUNNING')
-		 RETURNING id, client_batch_id, api_key_id, key_name, model, vendor_job_name, state,
-		           total_count, done_count, failed_count, attributes, action_id,
-		           created_at, completed_at, leased_until`,
-		now, id, apiKeyID).
-		Scan(&b.ID, &clientBatchID, &b.APIKeyID, &b.KeyName, &b.Model, &b.VendorJobName, &b.State,
-			&b.TotalCount, &b.DoneCount, &b.FailedCount, &attrsJSON, &b.ActionID,
-			&b.CreatedAt, &b.CompletedAt, &b.LeasedUntil)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	if clientBatchID != nil {
-		b.ClientBatchID = *clientBatchID
-	}
-	if len(attrsJSON) > 0 {
-		_ = json.Unmarshal(attrsJSON, &b.Attributes)
-	}
-
-	cancelErrBytes := llm.NewBatchItemError(codes.Canceled, "batch_cancelled", "batch was cancelled").JSON()
-	if _, err := tx.Exec(ctx,
-		`UPDATE batch_item
-		 SET status = 'FAILED', error = $1
-		 WHERE batch_id = $2 AND status = 'PENDING'`,
-		cancelErrBytes, id); err != nil {
-		return nil, fmt.Errorf("fail pending items on cancel: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return &b, nil
-}
-
 func (d *DB) LeaseUnfinishedBatches(ctx context.Context, leaseDuration time.Duration, limit int) ([]*Batch, error) {
 	rows, err := d.pool.Query(ctx,
 		`UPDATE batch

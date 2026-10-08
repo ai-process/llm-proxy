@@ -139,8 +139,14 @@ func TestGoogleBatchAdapter_HTTPOperations(t *testing.T) {
 				}
 			}`))
 
-		// Batches.Cancel: POST /v1beta/batches/job-123:cancel
+		// Batches.Cancel: POST /v1beta/batches/...:cancel
 		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, ":cancel"):
+			if strings.Contains(r.URL.Path, "already-cancelled") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error": {"code": 400, "message": "job is already cancelled", "status": "FAILED_PRECONDITION"}}`))
+				return
+			}
 			cancelledBatchName = r.URL.Path
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -323,6 +329,9 @@ func TestGoogleBatchAdapter_HTTPOperations(t *testing.T) {
 	}
 	if !strings.Contains(cancelledBatchName, "batches/job-123:cancel") {
 		t.Fatalf("unexpected cancel path: %s", cancelledBatchName)
+	}
+	if err := adapter.CancelBatch(ctx, "batches/job-already-cancelled"); err != nil {
+		t.Fatalf("CancelBatch idempotent failed: %v", err)
 	}
 
 	// 5. Expired batch

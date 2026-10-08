@@ -76,14 +76,6 @@ func (f *fakePollerDB) ExpireBatch(ctx context.Context, id string, expiredAt tim
 	return nil
 }
 
-func (f *fakePollerDB) CancelBatch(ctx context.Context, id, apiKeyID string) (*proxydb.Batch, error) {
-	if b, ok := f.batches[id]; ok {
-		b.State = "CANCELLED"
-		return b, nil
-	}
-	return nil, proxydb.ErrNotFound
-}
-
 func (f *fakePollerDB) ListAllBatchItems(ctx context.Context, batchID string) ([]*proxydb.BatchItem, error) {
 	return f.items[batchID], nil
 }

@@ -210,15 +210,12 @@ func TestBatchStorageAndIdempotency(t *testing.T) {
 		t.Fatalf("unexpected item 1 error: %s", string(storedItems[1].Error))
 	}
 
-	// 7. Verify terminal state guards: CompleteBatch, ExpireBatch, CancelBatch cannot mutate SUCCEEDED batch
+	// 7. Verify terminal state guards: CompleteBatch, ExpireBatch cannot mutate SUCCEEDED batch
 	if err := db.CompleteBatch(ctx, batchID, "FAILED", 0, 2, now, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound when trying to complete already SUCCEEDED batch, got %v", err)
 	}
 	if err := db.ExpireBatch(ctx, batchID, now); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound when trying to expire already SUCCEEDED batch, got %v", err)
-	}
-	if _, err := db.CancelBatch(ctx, batchID, testAPIKeyID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected ErrNotFound when trying to cancel already SUCCEEDED batch, got %v", err)
 	}
 	finalBatch, _ := db.GetBatchByID(ctx, batchID)
 	if finalBatch.State != "SUCCEEDED" {
@@ -302,49 +299,12 @@ func TestBatchLeasingSkipLocked(t *testing.T) {
 	}
 }
 
-func TestBatchCancelAndExpire(t *testing.T) {
+func TestBatchExpire(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
 
-	// 1. Cancel
-	cancelID := uuid.NewString()
-	_, err := db.CreateBatch(ctx, &Batch{
-		ID:        cancelID,
-		APIKeyID:  testAPIKeyID,
-		KeyName:   "client-test",
-		Model:     "gemini-flash",
-		State:     "RUNNING",
-		CreatedAt: time.Now().UTC(),
-	}, []*BatchItem{
-		{BatchID: cancelID, CustomID: "c1", Status: "PENDING"},
-	})
-	if err != nil {
-		t.Fatalf("create cancel batch failed: %v", err)
-	}
-
-	cancelled, err := db.CancelBatch(ctx, cancelID, testAPIKeyID)
-	if err != nil {
-		t.Fatalf("CancelBatch failed: %v", err)
-	}
-	if cancelled.State != "CANCELLED" {
-		t.Fatalf("expected state CANCELLED, got %s", cancelled.State)
-	}
-	items, _ := db.ListBatchItems(ctx, cancelID, 10, 0)
-	if items[0].Status != "FAILED" {
-		t.Fatalf("expected pending item to be marked FAILED on cancel, got %s", items[0].Status)
-	}
-	var cancelErrObj struct {
-		Code    int    `json:"code"`
-		Reason  string `json:"reason"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(items[0].Error, &cancelErrObj); err != nil || cancelErrObj.Code != 1 || cancelErrObj.Reason != "batch_cancelled" {
-		t.Fatalf("unexpected cancel error payload: %s", string(items[0].Error))
-	}
-
-	// 2. Expire
 	expireID := uuid.NewString()
-	_, err = db.CreateBatch(ctx, &Batch{
+	_, err := db.CreateBatch(ctx, &Batch{
 		ID:        expireID,
 		APIKeyID:  testAPIKeyID,
 		KeyName:   "client-test",

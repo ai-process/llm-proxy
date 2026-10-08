@@ -82,17 +82,6 @@ func (s *fakeBatchStore) ListBatchItems(ctx context.Context, batchID string, lim
 	return all[offset:end], nil
 }
 
-func (s *fakeBatchStore) CancelBatch(ctx context.Context, id, apiKeyID string) (*proxydb.Batch, error) {
-	b, err := s.GetBatch(ctx, id, apiKeyID)
-	if err != nil {
-		return nil, err
-	}
-	b.State = "CANCELLED"
-	now := time.Now().UTC()
-	b.CompletedAt = &now
-	return b, nil
-}
-
 type fakeBatchAdapter struct {
 	submittedID    string
 	submitted      []*llm.BatchSubmitItem

@@ -266,7 +266,7 @@ Vendors: `openai`, `google`, `deepseek` (OpenAI-compatible API, default endpoint
     "price_in_batch_per_mtok": 0,           // batch pricing; 0 defaults to half normal price
     "price_out_batch_per_mtok": 0,
     "daily_tokens_per_key": 50000000,       // per API key per UTC day, 0 = unlimited
-    "daily_tokens_per_user": 500000,        // per attributes["user_id"] per UTC day
+    "daily_tokens_per_user": 500000,        // per attributes["user_id"] (or svc:<key_name> fallback) per UTC day
     "enabled": true } }
 ```
 
@@ -353,7 +353,7 @@ Python, TypeScript… clients from [`proto/llmproxy/v1`](proto/llmproxy/v1) with
 | Field | Notes |
 | --- | --- |
 | `effort` | Routing tier. |
-| `attributes` | Opaque key/values matched by rules and copied to usage events. `user_id` charges the per-user daily budget. `usage_project` overrides the usage project (see below). |
+| `attributes` | Opaque key/values matched by rules and copied to usage events. `user_id` charges the per-user daily budget (falls back to `svc:<key_name>` for service callers without `user_id`). `usage_project` overrides the usage project (see below). |
 | `base_system_instruction`, `request_instruction` | System content never travels as a message. |
 | `response_schema` | Unset = free text. Set = JSON output validated against the schema; a vendor that can't enforce it is verified by the proxy. |
 | `max_output_tokens` | Ceiling, `0` = none. Output tokens are the expensive ones; set it. |
@@ -425,7 +425,7 @@ grpcurl -plaintext -H "authorization: Bearer llm_<key>" -d '{
 
 #### CancelBatch
 
-Cancels an unfinished batch job at the vendor and marks remaining pending items as failed:
+Requests cancellation of an unfinished batch job at the vendor. The batch remains `RUNNING` until vendor confirmation is polled: already completed items preserve their results, while remaining unfinished items fail with reason `batch_cancelled`.
 
 ```bash
 grpcurl -plaintext -H "authorization: Bearer llm_<key>" -d '{

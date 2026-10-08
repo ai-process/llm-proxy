@@ -80,7 +80,7 @@ func (e *SchemaFailure) Unwrap() error { return e.Err }
 type Request struct {
 	Chain    []*proxydb.Model // pre-filtered candidates, in fallback order
 	KeyName  string           // api_key name: throttle keys, logs
-	UserID   string           // attributes["user_id"], "" = no user budget
+	UserID   string           // attributes["user_id"] or svc:<keyName> fallback
 	Estimate int64            // estimated input tokens to reserve
 	Chat     *llm.ChatContext
 	// Adapter resolves the vendor adapter for a chain model — a closure over

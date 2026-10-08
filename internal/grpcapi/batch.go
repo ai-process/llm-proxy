@@ -27,7 +27,6 @@ type BatchStore interface {
 	GetBatch(ctx context.Context, id, apiKeyID string) (*proxydb.Batch, error)
 	GetBatchByClientBatchID(ctx context.Context, apiKeyID, clientBatchID string) (*proxydb.Batch, error)
 	ListBatchItems(ctx context.Context, batchID string, limit, offset int) ([]*proxydb.BatchItem, error)
-	CancelBatch(ctx context.Context, id, apiKeyID string) (*proxydb.Batch, error)
 }
 
 // WithBatch configures the batch store and max item limit on the server.
