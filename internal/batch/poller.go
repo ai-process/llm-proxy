@@ -186,14 +186,9 @@ func (p *Poller) processBatch(ctx context.Context, b *proxydb.Batch) error {
 		return p.db.UpdateBatchRunning(ctx, b.ID, status.TotalCount, status.DoneCount, status.FailedCount)
 
 	case "EXPIRED":
-		// Mark expired in DB and fail unfinished items with batch_expired
 		return p.db.ExpireBatch(ctx, b.ID, time.Now().UTC())
 
-	case "CANCELLED":
-		_, err := p.db.CancelBatch(ctx, b.ID, b.APIKeyID)
-		return err
-
-	case "SUCCEEDED", "FAILED":
+	case "CANCELLED", "SUCCEEDED", "FAILED":
 		return p.completeBatch(batchCtx, b, m, batchAdapter, status)
 
 	default:
@@ -294,7 +289,15 @@ func (p *Poller) completeBatch(
 		} else {
 			failedCount++
 			itemUpdate.Status = "FAILED"
-			itemErr := llm.NewBatchItemError(codes.Internal, "vendor_error", "no response received from vendor")
+			code := codes.Internal
+			reason := "vendor_error"
+			msg := "no response received from vendor"
+			if status.State == "CANCELLED" {
+				code = codes.Canceled
+				reason = "batch_cancelled"
+				msg = "batch was cancelled"
+			}
+			itemErr := llm.NewBatchItemError(code, reason, msg)
 			itemUpdate.Error = itemErr.JSON()
 			usageQueue = append(usageQueue, pendingUsage{
 				customID:  res.CustomID,
@@ -309,6 +312,9 @@ func (p *Poller) completeBatch(
 	finalState := "SUCCEEDED"
 	if failedCount > 0 && doneCount == 0 {
 		finalState = "FAILED"
+	}
+	if status.State == "CANCELLED" {
+		finalState = "CANCELLED"
 	}
 	completedAt := time.Now().UTC()
 	if status.CompletedAt != nil {
@@ -370,7 +376,7 @@ func (p *Poller) emitUsage(
 		actionID = "llmproxy.generate_text"
 	}
 
-	_ = p.tracker.RecordUsage(
+	if err := p.tracker.RecordUsage(
 		userID,
 		actionID,
 		m.Vendor,
@@ -380,5 +386,7 @@ func (p *Poller) emitUsage(
 		0,
 		status,
 		meta,
-	)
+	); err != nil {
+		log.Error().Err(err).Str("batch_id", b.ID).Str("custom_id", customID).Msg("failed to record batch item usage")
+	}
 }

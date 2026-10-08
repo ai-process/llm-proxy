@@ -419,8 +419,8 @@ func TestCancelBatch(t *testing.T) {
 	}
 
 	b := store.batches["b-cancel"]
-	if b.State != "CANCELLED" {
-		t.Fatalf("expected state CANCELLED, got %s", b.State)
+	if b.State != "RUNNING" {
+		t.Fatalf("expected state to remain RUNNING until poller confirms and fetches results, got %s", b.State)
 	}
 
 	// Vendor cancel error must propagate and not mark batch cancelled

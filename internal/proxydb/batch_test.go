@@ -412,3 +412,57 @@ func TestBatchRetentionCleanup(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for deleted batch, got %v", err)
 	}
 }
+
+func TestBatchCreate_ConcurrentIdempotentInsert(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	clientBatchID := "concurrent-race-" + uuid.NewString()
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	results := make([]*Batch, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			b := &Batch{
+				ID:            uuid.NewString(),
+				ClientBatchID: clientBatchID,
+				APIKeyID:      testAPIKeyID,
+				KeyName:       "test-key",
+				Model:         "gemini-flash",
+				VendorJobName: "vendor-job-" + uuid.NewString(),
+				State:         "PENDING",
+				TotalCount:    1,
+				CreatedAt:     time.Now().UTC(),
+			}
+			res, err := db.CreateBatch(ctx, b, []*BatchItem{{
+				BatchID:  b.ID,
+				CustomID: "c1",
+				Status:   "PENDING",
+			}})
+			results[idx] = res
+			errs[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	var firstID string
+	for i := 0; i < concurrency; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d failed to create or fetch idempotent batch: %v", i, errs[i])
+		}
+		if results[i] == nil {
+			t.Fatalf("goroutine %d returned nil batch", i)
+		}
+		if firstID == "" {
+			firstID = results[i].ID
+		} else if results[i].ID != firstID {
+			t.Fatalf("goroutine %d returned different batch ID %s, expected %s", i, results[i].ID, firstID)
+		}
+	}
+}

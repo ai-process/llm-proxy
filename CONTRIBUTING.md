@@ -40,5 +40,12 @@ a usage sink.
   fallback).
 - Map vendor states carefully. In-between vendor states such as `CANCELLING`
   or `UPDATING` map to an unfinished state, never to a final one.
+- Postgres transactions: after any error inside a transaction, the
+  transaction is unusable. Don't run more queries on the same `tx`; use
+  `ON CONFLICT`, a savepoint, or a new query after rollback. Test idempotency
+  paths against a real database, not mocks.
+- Cancelling vendor jobs is a request, not a result: a local row moves to
+  `CANCELLED` only after the vendor confirms it and its results have been
+  fetched.
 - `gen/` is committed; regenerate with `make proto` after editing `proto/`.
 - Run `go test ./... -race` before committing.

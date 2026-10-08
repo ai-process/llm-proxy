@@ -116,12 +116,6 @@ func (s *ProxyServer) SubmitBatch(ctx context.Context, req *pb.SubmitBatchReques
 		return nil, status.Error(codes.FailedPrecondition, "no_capable_model")
 	}
 
-	if req.GetClientBatchId() != "" {
-		if existing, err := s.batchStore.GetBatchByClientBatchID(ctx, id.KeyID, req.GetClientBatchId()); err == nil && existing != nil {
-			return &pb.SubmitBatchResponse{Batch: batchToProto(existing)}, nil
-		}
-	}
-
 	batchID := uuid.Must(uuid.NewV7()).String()
 	adapterItems := make([]*llm.BatchSubmitItem, len(items))
 	dbItems := make([]*proxydb.BatchItem, len(items))
@@ -352,15 +346,7 @@ func (s *ProxyServer) CancelBatch(ctx context.Context, req *pb.CancelBatchReques
 		return nil, status.Errorf(codes.Internal, "vendor cancel batch failed: %v", err)
 	}
 
-	_, err = s.batchStore.CancelBatch(ctx, b.ID, id.KeyID)
-	if err != nil {
-		if errors.Is(err, proxydb.ErrNotFound) {
-			// Already moved to a terminal state
-			return &pb.CancelBatchResponse{}, nil
-		}
-		return nil, status.Errorf(codes.Internal, "cancel batch in store: %v", err)
-	}
-
+	// Cancelling vendor job is a request; row stays running until vendor confirms and poller fetches results
 	return &pb.CancelBatchResponse{}, nil
 }
 

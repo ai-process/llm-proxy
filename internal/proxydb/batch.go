@@ -43,26 +43,42 @@ func (d *DB) CreateBatch(ctx context.Context, b *Batch, items []*BatchItem) (*Ba
 		}
 	}
 
-	_, err = tx.Exec(ctx,
-		`INSERT INTO batch (id, client_batch_id, api_key_id, key_name, model, vendor_job_name,
+	var query string
+	if b.ClientBatchID != "" {
+		query = `INSERT INTO batch (id, client_batch_id, api_key_id, key_name, model, vendor_job_name,
 		                    state, total_count, done_count, failed_count, attributes,
 		                    action_id, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		 ON CONFLICT (api_key_id, client_batch_id) WHERE client_batch_id IS NOT NULL AND client_batch_id != '' DO NOTHING`
+	} else {
+		query = `INSERT INTO batch (id, client_batch_id, api_key_id, key_name, model, vendor_job_name,
+		                    state, total_count, done_count, failed_count, attributes,
+		                    action_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+	}
+	tag, err := tx.Exec(ctx, query,
 		b.ID, b.ClientBatchID, b.APIKeyID, b.KeyName, b.Model, b.VendorJobName,
 		b.State, b.TotalCount, b.DoneCount, b.FailedCount, attrsJSON,
 		b.ActionID, b.CreatedAt,
 	)
 	if err != nil {
+		_ = tx.Rollback(ctx)
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique violation
-			if b.ClientBatchID != "" {
-				existing, getErr := getBatchByClientBatchID(ctx, tx, b.APIKeyID, b.ClientBatchID)
-				if getErr == nil {
-					return existing, nil
-				}
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && b.ClientBatchID != "" {
+			existing, getErr := d.GetBatchByClientBatchID(ctx, b.APIKeyID, b.ClientBatchID)
+			if getErr == nil {
+				return existing, nil
 			}
 		}
 		return nil, fmt.Errorf("insert batch: %w", err)
+	}
+	if tag.RowsAffected() == 0 && b.ClientBatchID != "" {
+		_ = tx.Rollback(ctx)
+		existing, getErr := d.GetBatchByClientBatchID(ctx, b.APIKeyID, b.ClientBatchID)
+		if getErr == nil {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("batch insert conflict, but failed to fetch existing batch: %w", getErr)
 	}
 
 	if len(items) > 0 {
@@ -342,6 +358,17 @@ func (d *DB) CompleteBatch(ctx context.Context, id string, finalState string, do
 		}
 		if err := br.Close(); err != nil {
 			return fmt.Errorf("close batch items update: %w", err)
+		}
+	}
+
+	if finalState == "CANCELLED" {
+		cancelErrBytes := llm.NewBatchItemError(codes.Canceled, "batch_cancelled", "batch was cancelled").JSON()
+		if _, err := tx.Exec(ctx,
+			`UPDATE batch_item
+			 SET status = 'FAILED', error = $1
+			 WHERE batch_id = $2 AND status = 'PENDING'`,
+			cancelErrBytes, id); err != nil {
+			return fmt.Errorf("fail remaining pending items on complete cancelled: %w", err)
 		}
 	}
 

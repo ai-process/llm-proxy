@@ -42,7 +42,7 @@ func (s *ProxyServer) SynthesizeSpeech(ctx context.Context, req *pb.SynthesizeSp
 	model, err := router.ExecuteMedia(ctx, s.throttle, router.MediaRequest{
 		Chain:   plan.chain,
 		KeyName: plan.identity.Name,
-		UserID:  plan.attrs["user_id"],
+		UserID:  router.UserID(plan.attrs, plan.identity.Name),
 		// Input-side estimate only; Settle replaces it with what the vendor
 		// billed, which for speech is audio tokens and far larger.
 		Estimate: int64(len([]rune(req.GetText()))/4 + 1),
@@ -91,7 +91,7 @@ func (s *ProxyServer) GenerateImage(ctx context.Context, req *pb.GenerateImageRe
 	model, err := router.ExecuteMedia(ctx, s.throttle, router.MediaRequest{
 		Chain:   plan.chain,
 		KeyName: plan.identity.Name,
-		UserID:  plan.attrs["user_id"],
+		UserID:  router.UserID(plan.attrs, plan.identity.Name),
 		// Input-side estimate only; image output tokens dwarf it, so Settle is
 		// what makes the budget accounting true.
 		Estimate: int64(len([]rune(req.GetPrompt()))/4 + 1),

@@ -295,6 +295,83 @@ func TestPoller_ProcessExpiredBatch(t *testing.T) {
 	}
 }
 
+func TestPoller_ProcessCancelledBatch_FetchesLateResults(t *testing.T) {
+	adapter := &fakeBatchAdapter{
+		status: &llm.BatchJobStatus{
+			State: "CANCELLED",
+		},
+		results: []*llm.BatchItemResult{
+			{
+				CustomID: "c1",
+				Response: &llm.Response{
+					Choices: []*llm.Message{{Text: "late finished item"}},
+					Usage:   llm.TokensUsage{Input: 100, Output: 50},
+				},
+			},
+			{
+				CustomID: "c2", // unfinished when cancelled
+			},
+		},
+	}
+	model := &proxydb.Model{
+		ID:                  "gemini-flash",
+		Vendor:              registry.VendorGoogle,
+		Capabilities:        []string{registry.CapabilityBatch},
+		PriceInBatchPerMtok: 0.5,
+		PriceOutBatchPerMtok: 2.0,
+		Enabled:             true,
+	}
+
+	snap := registry.NewSnapshotForTest([]*proxydb.Model{model}, nil, nil, nil)
+	snap.SetAdapter("key-id-cancel", "gemini-flash", adapter)
+
+	db := newFakePollerDB()
+	batchRecord := &proxydb.Batch{
+		ID:            "b-cancel-late",
+		KeyName:       "client-app",
+		APIKeyID:      "key-id-cancel",
+		Model:         "gemini-flash",
+		VendorJobName: "vendor-job-cancel",
+		State:         "RUNNING",
+		Attributes:    map[string]string{"user_id": "u-99"},
+	}
+	db.batches["b-cancel-late"] = batchRecord
+	db.leased = []*proxydb.Batch{batchRecord}
+	db.items["b-cancel-late"] = []*proxydb.BatchItem{
+		{BatchID: "b-cancel-late", CustomID: "c1"},
+		{BatchID: "b-cancel-late", CustomID: "c2"},
+	}
+
+	tracker := &fakeUsageTracker{}
+	th := &fakeThrottle{}
+
+	poller := NewPoller(db, fixedSnapshot{snap}, th, tracker, 1*time.Second, 7*24*time.Hour)
+	poller.PollOnce(context.Background())
+
+	if db.completed["b-cancel-late"] != "CANCELLED" {
+		t.Fatalf("expected batch final state CANCELLED, got %s", db.completed["b-cancel-late"])
+	}
+	if db.completedDone["b-cancel-late"] != 1 || db.completedFail["b-cancel-late"] != 1 {
+		t.Fatalf("expected 1 done 1 failed, got %d done, %d fail", db.completedDone["b-cancel-late"], db.completedFail["b-cancel-late"])
+	}
+
+	// Verify finished item usage recorded and unfinished item recorded as error
+	if len(tracker.recordedEvents) != 2 {
+		t.Fatalf("expected 2 usage events, got %d", len(tracker.recordedEvents))
+	}
+	if tracker.recordedEvents[0].status != usagev1.Status_STATUS_SUCCESS || tracker.recordedEvents[0].inputTokens != 100 {
+		t.Fatalf("unexpected event 0: %+v", tracker.recordedEvents[0])
+	}
+	if tracker.recordedEvents[1].status != usagev1.Status_STATUS_ERROR || tracker.recordedEvents[1].meta["error_reason"] != "batch_cancelled" {
+		t.Fatalf("unexpected event 1: %+v", tracker.recordedEvents[1])
+	}
+
+	// Verify budget charged for finished item
+	if th.chargedTokens["gemini-flash:client-app:u-99"] != 150 {
+		t.Fatalf("expected 150 tokens charged, got %d", th.chargedTokens["gemini-flash:client-app:u-99"])
+	}
+}
+
 func TestPoller_DBCommitFailureDoesNotEmitUsage(t *testing.T) {
 	adapter := &fakeBatchAdapter{
 		status: &llm.BatchJobStatus{
