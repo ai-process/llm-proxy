@@ -592,12 +592,17 @@ func mapJobState(state genai.JobState) string {
 func (a *GoogleAdapter) CancelBatch(ctx context.Context, vendorJobID string) error {
 	err := a.geminiClient.Batches.Cancel(ctx, vendorJobID, nil)
 	if err != nil {
+		var apiErr genai.APIError
+		var apiErrPtr *genai.APIError
+		if (errors.As(err, &apiErr) && apiErr.Status == "FAILED_PRECONDITION") ||
+			(errors.As(err, &apiErrPtr) && apiErrPtr != nil && apiErrPtr.Status == "FAILED_PRECONDITION") {
+			return nil
+		}
 		errLower := strings.ToLower(err.Error())
 		if strings.Contains(errLower, "already") ||
 			strings.Contains(errLower, "cancelling") ||
 			strings.Contains(errLower, "canceling") ||
-			strings.Contains(errLower, "failed_precondition") ||
-			strings.Contains(errLower, "failedprecondition") {
+			strings.Contains(errLower, "failed_precondition") {
 			return nil
 		}
 		return fmt.Errorf("GoogleAdapter: cancel batch job %s: %w", vendorJobID, err)
