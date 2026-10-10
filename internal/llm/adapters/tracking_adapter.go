@@ -111,6 +111,105 @@ func (t *TrackingAdapter) GenerateText(chat *llm.ChatContext) (*llm.Response, er
 	return resp, err
 }
 
+// SupportsStreaming reports whether the underlying adapter supports streaming.
+func (t *TrackingAdapter) SupportsStreaming() bool {
+	streamer, ok := t.adapter.(llm.StreamAdapter)
+	if !ok {
+		return false
+	}
+	if sc, ok := streamer.(interface{ SupportsStreaming() bool }); ok {
+		return sc.SupportsStreaming()
+	}
+	return true
+}
+
+// GenerateTextStream forwards streaming text generation and tracks usage upon completion.
+func (t *TrackingAdapter) GenerateTextStream(ctx context.Context, chat *llm.ChatContext, onChunk func(llm.StreamChunk) error) error {
+	streamer, ok := t.adapter.(llm.StreamAdapter)
+	if !ok {
+		return fmt.Errorf("%w: model %s", llm.ErrStreamingNotSupported, t.model)
+	}
+
+	startTime := time.Now()
+	var userID string
+	if chat != nil {
+		userID = chat.GetInternalUserID()
+	}
+
+	actionID := "llm.generate_text"
+	var meta map[string]string
+	if chat != nil {
+		if actionIDFromContext := chat.GetActionID(); actionIDFromContext != "" {
+			actionID = actionIDFromContext
+		}
+		meta = chat.GetMeta()
+	}
+
+	var (
+		lastUsage        llm.TokensUsage
+		outputCharsCount int
+		chunksEmitted    int
+	)
+	wrappedChunk := func(chunk llm.StreamChunk) error {
+		chunksEmitted++
+		outputCharsCount += len([]rune(chunk.Delta))
+		for _, tc := range chunk.ToolCallChunks {
+			outputCharsCount += len([]rune(tc.ArgumentsDelta)) + len([]rune(tc.Name))
+		}
+		if chunk.Usage != nil {
+			lastUsage = *chunk.Usage
+		}
+		return onChunk(chunk)
+	}
+
+	err := streamer.GenerateTextStream(ctx, chat, wrappedChunk)
+	durationMs := time.Since(startTime).Milliseconds()
+
+	// If the stream ended without vendor token accounting (e.g. cut short or mid-stream disconnect),
+	// fall back to estimating consumed input and output tokens so usage is recorded.
+	if lastUsage.Input == 0 && lastUsage.Output == 0 && chunksEmitted > 0 {
+		if chat != nil {
+			lastUsage.Input = chat.EstimateInputTokens()
+		}
+		if outputCharsCount > 0 {
+			lastUsage.Output = outputCharsCount/4 + 1
+		} else {
+			lastUsage.Output = 1
+		}
+	}
+
+	if t.tracker != nil {
+		var status usagev1.Status
+		if err != nil {
+			status = usagev1.Status_STATUS_ERROR
+		} else {
+			status = usagev1.Status_STATUS_SUCCESS
+		}
+		if trackErr := t.tracker.RecordUsage(
+			userID,
+			actionID,
+			t.vendor,
+			t.model,
+			lastUsage.Input,
+			lastUsage.Output,
+			durationMs,
+			status,
+			meta,
+		); trackErr != nil {
+			log.Error().
+				Stack().
+				Err(trackErr).
+				Str("userID", userID).
+				Str("actionID", actionID).
+				Str("vendor", t.vendor).
+				Str("model", t.model).
+				Msg("Failed to record usage for stream")
+		}
+	}
+
+	return err
+}
+
 // SynthesizeSpeech synthesizes speech and tracks usage
 func (t *TrackingAdapter) SynthesizeSpeech(text, language, userID string, meta map[string]string) (*llm.SpeechResult, error) {
 	startTime := time.Now()
